@@ -60,6 +60,7 @@ struct reclaim_state;
 struct robust_list_head;
 struct root_domain;
 struct rq;
+struct mlq_rq;
 struct sched_attr;
 struct sched_param;
 struct seq_file;
@@ -562,6 +563,13 @@ struct sched_entity {
 #endif
 };
 
+struct sched_mlq_entity {
+	struct list_head		task_list;
+	unsigned long			timeout;
+	unsigned int			time_slice;
+	unsigned short			on_rq;
+};
+
 struct sched_rt_entity {
 	struct list_head		run_list;
 	unsigned long			timeout;
@@ -779,6 +787,7 @@ struct task_struct {
 	struct sched_entity		se;
 	struct sched_rt_entity		rt;
 	struct sched_dl_entity		dl;
+	struct sched_mlq_entity		mlq;
 
 #ifdef CONFIG_SCHED_CORE
 	struct rb_node			core_node;

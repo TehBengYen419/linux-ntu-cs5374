@@ -22,6 +22,7 @@
 #include <linux/sched/numa_balancing.h>
 #include <linux/sched/prio.h>
 #include <linux/sched/rt.h>
+#include <linux/sched/mlq.h>
 #include <linux/sched/signal.h>
 #include <linux/sched/smt.h>
 #include <linux/sched/stat.h>
@@ -173,6 +174,11 @@ static inline int rt_policy(int policy)
 	return policy == SCHED_FIFO || policy == SCHED_RR;
 }
 
+static inline int mlq_policy(int policy)
+{
+	return policy == SCHED_MLQ;
+}
+
 static inline int dl_policy(int policy)
 {
 	return policy == SCHED_DEADLINE;
@@ -180,7 +186,7 @@ static inline int dl_policy(int policy)
 static inline bool valid_policy(int policy)
 {
 	return idle_policy(policy) || fair_policy(policy) ||
-		rt_policy(policy) || dl_policy(policy);
+		rt_policy(policy) || dl_policy(policy) || mlq_policy(policy);
 }
 
 static inline int task_has_idle_policy(struct task_struct *p)
@@ -191,6 +197,11 @@ static inline int task_has_idle_policy(struct task_struct *p)
 static inline int task_has_rt_policy(struct task_struct *p)
 {
 	return rt_policy(p->policy);
+}
+
+static inline int task_has_mlq_policy(struct task_struct *p)
+{
+	return mlq_policy(p->policy);
 }
 
 static inline int task_has_dl_policy(struct task_struct *p)
@@ -359,6 +370,7 @@ extern bool dl_cpu_busy(unsigned int cpu);
 
 struct cfs_rq;
 struct rt_rq;
+struct mlq_rq;
 
 extern struct list_head task_groups;
 
@@ -674,6 +686,11 @@ static inline bool rt_rq_is_runnable(struct rt_rq *rt_rq)
 	return rt_rq->rt_queued && rt_rq->rt_nr_running;
 }
 
+struct mlq_rq {
+	unsigned int mlq_nr_running;
+	struct list_head task_list;
+};
+
 /* Deadline class' related fields in a runqueue */
 struct dl_rq {
 	/* runqueue is an rbtree, ordered by deadline */
@@ -958,6 +975,7 @@ struct rq {
 	struct cfs_rq		cfs;
 	struct rt_rq		rt;
 	struct dl_rq		dl;
+	struct mlq_rq		mlq;
 
 #ifdef CONFIG_FAIR_GROUP_SCHED
 	/* list of leaf cfs_rq on this CPU: */
@@ -2215,6 +2233,7 @@ extern struct sched_class __end_sched_classes[];
 extern const struct sched_class stop_sched_class;
 extern const struct sched_class dl_sched_class;
 extern const struct sched_class rt_sched_class;
+extern const struct sched_class mlq_sched_class;
 extern const struct sched_class fair_sched_class;
 extern const struct sched_class idle_sched_class;
 
@@ -2700,6 +2719,7 @@ static inline void resched_latency_warn(int cpu, u64 latency) {}
 
 extern void init_cfs_rq(struct cfs_rq *cfs_rq);
 extern void init_rt_rq(struct rt_rq *rt_rq);
+extern void init_mlq_rq(struct mlq_rq *mlq_rq);
 extern void init_dl_rq(struct dl_rq *dl_rq);
 
 extern void cfs_bandwidth_usage_inc(void);
