@@ -2010,7 +2010,7 @@ void deactivate_task(struct rq *rq, struct task_struct *p, int flags)
 	dequeue_task(rq, p, flags);
 }
 
-static inline int __normal_prio(int policy, int rt_prio, int nice)
+static inline int __normal_prio(int policy, int rt_prio, int mlq_prio, int nice)
 {
 	int prio;
 
@@ -2018,6 +2018,8 @@ static inline int __normal_prio(int policy, int rt_prio, int nice)
 		prio = MAX_DL_PRIO - 1;
 	else if (rt_policy(policy))
 		prio = MAX_RT_PRIO - 1 - rt_prio;
+	else if (mlq_policy(policy))
+		prio = mlq_prio;
 	else
 		prio = NICE_TO_PRIO(nice);
 
@@ -2033,7 +2035,7 @@ static inline int __normal_prio(int policy, int rt_prio, int nice)
  */
 static inline int normal_prio(struct task_struct *p)
 {
-	return __normal_prio(p->policy, p->rt_priority, PRIO_TO_NICE(p->static_prio));
+	return __normal_prio(p->policy, p->rt_priority, p->mlq_priority, PRIO_TO_NICE(p->static_prio));
 }
 
 /*
@@ -2051,6 +2053,7 @@ static int effective_prio(struct task_struct *p)
 	 * keep the priority unchanged. Otherwise, update priority
 	 * to the normal priority:
 	 */
+	// if (!rt_prio(p->prio) || !mlq_prio(p->prio))
 	if (!rt_prio(p->prio))
 		return p->normal_prio;
 	return p->prio;
@@ -4349,12 +4352,13 @@ int sched_fork(unsigned long clone_flags, struct task_struct *p)
 	 * Revert to default priority/policy on fork if requested.
 	 */
 	if (unlikely(p->sched_reset_on_fork)) {
-		// if (task_has_dl_policy(p) || task_has_rt_policy(p) || task_has_mlq_policy(p)) {
-		if (task_has_dl_policy(p) || task_has_rt_policy(p) || p->policy == SCHED_NORMAL) {
-			// p->policy = SCHED_NORMAL;
-			p->policy = SCHED_MLQ;
+		if (task_has_dl_policy(p) || task_has_rt_policy(p) || task_has_mlq_policy(p)) {
+		// if (task_has_dl_policy(p) || task_has_rt_policy(p) || p->policy == SCHED_NORMAL) {
+			p->policy = SCHED_NORMAL;
+			// p->policy = SCHED_MLQ;
 			p->static_prio = NICE_TO_PRIO(0);
 			p->rt_priority = 0;
+			p->mlq_priority = 1;
 		} else if (PRIO_TO_NICE(p->static_prio) < 0)
 			p->static_prio = NICE_TO_PRIO(0);
 
@@ -4370,10 +4374,9 @@ int sched_fork(unsigned long clone_flags, struct task_struct *p)
 
 	if (dl_prio(p->prio))
 		return -EAGAIN;
-	else if (rt_prio(p->prio))
+	else if (task_has_rt_policy(p) && rt_prio(p->prio))
 		p->sched_class = &rt_sched_class;
-	// else if (mlq_prio(p->prio))
-	else if (p->policy == SCHED_MLQ)
+	else if (task_has_mlq_policy(p) && mlq_prio(p->prio))
 		p->sched_class = &mlq_sched_class;
 	else
 		p->sched_class = &fair_sched_class;
@@ -6891,7 +6894,7 @@ void set_user_nice(struct task_struct *p, long nice)
 	 * it won't have any effect on scheduling until the task is
 	 * SCHED_DEADLINE, SCHED_FIFO or SCHED_RR:
 	 */
-	if (task_has_dl_policy(p) || task_has_rt_policy(p)) {
+	if (task_has_dl_policy(p) || task_has_rt_policy(p) || task_has_mlq_policy(p)) {
 		p->static_prio = NICE_TO_PRIO(nice);
 		goto out_unlock;
 	}
@@ -7186,13 +7189,15 @@ static void __setscheduler_params(struct task_struct *p,
 		__setparam_dl(p, attr);
 	else if (fair_policy(policy))
 		p->static_prio = NICE_TO_PRIO(attr->sched_nice);
-
+	else if (mlq_policy(policy))
+		p->mlq_priority = attr->sched_priority;
+	else
+		p->rt_priority = attr->sched_priority;
 	/*
 	 * __sched_setscheduler() ensures attr->sched_priority == 0 when
 	 * !rt_policy. Always setting this ensures that things like
 	 * getparam()/getattr() don't report silly values for !rt tasks.
 	 */
-	p->rt_priority = attr->sched_priority;
 	p->normal_prio = normal_prio(p);
 	set_load_weight(p, true);
 }
@@ -7251,9 +7256,11 @@ recheck:
 	if (attr->sched_priority > MAX_RT_PRIO-1)
 		return -EINVAL;
 	if ((dl_policy(policy) && !__checkparam_dl(attr)) ||
-	    (rt_policy(policy) != (attr->sched_priority != 0)))
+	    (rt_policy(policy) && !rt_prio(attr->sched_priority)) || 
+		(mlq_policy(policy) && !mlq_prio(attr->sched_priority))) {
+		pr_info("policy %d, prio %d\n", policy, attr->sched_priority);
 		return -EINVAL;
-
+	}
 	/*
 	 * Allow unprivileged RT tasks to decrease priority:
 	 */
@@ -7349,6 +7356,8 @@ recheck:
 	if (unlikely(policy == p->policy)) {
 		if (fair_policy(policy) && attr->sched_nice != task_nice(p))
 			goto change;
+		if (mlq_policy(policy) && attr->sched_priority != p->mlq_priority)
+			goto change;
 		if (rt_policy(policy) && attr->sched_priority != p->rt_priority)
 			goto change;
 		if (dl_policy(policy) && dl_param_changed(p, attr))
@@ -7416,7 +7425,7 @@ change:
 	p->sched_reset_on_fork = reset_on_fork;
 	oldprio = p->prio;
 
-	newprio = __normal_prio(policy, attr->sched_priority, attr->sched_nice);
+	newprio = __normal_prio(policy, attr->sched_priority, attr->sched_priority, attr->sched_nice);
 	if (pi) {
 		/*
 		 * Take priority boosted tasks into account. If the new
@@ -7491,6 +7500,8 @@ static int _sched_setscheduler(struct task_struct *p, int policy,
 		.sched_priority = param->sched_priority,
 		.sched_nice	= PRIO_TO_NICE(p->static_prio),
 	};
+
+	pr_info("_sched_setscheduler: %d %d %d\n", policy, param->sched_priority, attr.sched_nice);
 
 	/* Fixup the legacy SCHED_RESET_ON_FORK hack. */
 	if ((policy != SETPARAM_POLICY) && (policy & SCHED_RESET_ON_FORK)) {
@@ -7672,6 +7683,8 @@ static void get_params(struct task_struct *p, struct sched_attr *attr)
 		__getparam_dl(p, attr);
 	else if (task_has_rt_policy(p))
 		attr->sched_priority = p->rt_priority;
+	else if (task_has_mlq_policy(p))
+		attr->sched_priority = p->mlq_priority;
 	else
 		attr->sched_nice = task_nice(p);
 }
@@ -7688,6 +7701,8 @@ SYSCALL_DEFINE3(sched_setscheduler, pid_t, pid, int, policy, struct sched_param 
 {
 	if (policy < 0)
 		return -EINVAL;
+
+	pr_info("pid %d, policy %d\n", pid, policy);
 
 	return do_sched_setscheduler(pid, policy, param);
 }
@@ -7803,6 +7818,8 @@ SYSCALL_DEFINE2(sched_getparam, pid_t, pid, struct sched_param __user *, param)
 
 	if (task_has_rt_policy(p))
 		lp.sched_priority = p->rt_priority;
+	if (task_has_mlq_policy(p))
+		lp.sched_priority = p->mlq_priority;
 	rcu_read_unlock();
 
 	/*
@@ -8413,6 +8430,9 @@ SYSCALL_DEFINE1(sched_get_priority_max, int, policy)
 	case SCHED_RR:
 		ret = MAX_RT_PRIO-1;
 		break;
+	case SCHED_MLQ:
+		ret = MAX_MLQ_PRIO;
+		break;
 	case SCHED_DEADLINE:
 	case SCHED_NORMAL:
 	case SCHED_BATCH:
@@ -8438,6 +8458,9 @@ SYSCALL_DEFINE1(sched_get_priority_min, int, policy)
 	switch (policy) {
 	case SCHED_FIFO:
 	case SCHED_RR:
+		ret = 1;
+		break;
+	case SCHED_MLQ:
 		ret = 1;
 		break;
 	case SCHED_DEADLINE:

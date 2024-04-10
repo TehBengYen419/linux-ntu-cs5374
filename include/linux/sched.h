@@ -782,6 +782,7 @@ struct task_struct {
 	int				static_prio;
 	int				normal_prio;
 	unsigned int			rt_priority;
+	unsigned int			mlq_priority;
 
 	const struct sched_class	*sched_class;
 	struct sched_entity		se;
