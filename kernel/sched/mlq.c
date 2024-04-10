@@ -1,111 +1,243 @@
-#include <linux/jiffies.h>
-#include <linux/kernel.h>
-#include <linux/sched/mlq.h>
-#include <linux/sched/task.h>
-
 #include "sched.h"
 
 void init_mlq_rq(struct mlq_rq *mlq_rq) {
-    INIT_LIST_HEAD(&mlq_rq->task_list);
-    mlq_rq->mlq_nr_running = 0;
+
+	struct mlq_prio_array *array;
+	int i;
+
+	array = &mlq_rq->active;
+	for (i = 0; i < MAX_MLQ_PRIO; i++) {
+		INIT_LIST_HEAD(array->queue + i);
+		__clear_bit(i, array->bitmap);
+	}
+	__set_bit(MAX_MLQ_PRIO, array->bitmap);
+	mlq_rq->mlq_nr_running = 0;
 }
 
-static inline int on_mlq_rq(struct sched_mlq_entity *mlq_se) { return mlq_se->on_rq; }
+static inline int on_mlq_rq(struct sched_mlq_entity *mlq_se)
+{
+	return mlq_se->on_rq;
+}
 
-static inline struct task_struct *mlq_task_of(struct sched_mlq_entity *mlq_se) {
+static inline struct task_struct *mlq_task_of(struct sched_mlq_entity *mlq_se)
+{
     return container_of(mlq_se, struct task_struct, mlq);
 }
 
-static void enqueue_mlq_entity(struct rq *rq, struct sched_mlq_entity *mlq_se, bool head) {
-    struct list_head *queue = &rq->mlq.task_list;
-
-    if (head)
-        list_add(&mlq_se->task_list, queue);
-    else
-        list_add_tail(&mlq_se->task_list, queue);
-
-    mlq_se->on_rq = 1;
-
-    ++rq->mlq.mlq_nr_running;
+static inline int mlq_se_prio(struct sched_mlq_entity *mlq_se)
+{
+	/* 0: unused, 1,2: RR, 3: FIFO */
+	return mlq_task_of(mlq_se)->prio;
 }
 
-static void dequeue_mlq_entity(struct rq *rq, struct sched_mlq_entity *mlq_se) {
-    list_del_init(&mlq_se->task_list);
-    mlq_se->on_rq = 0;
-    --rq->mlq.mlq_nr_running;
+static inline
+int mlq_rr_nr_running(int prio)
+{
+	return (prio < MAX_MLQ_RR_PRIO)? 1 : 0;
 }
 
-static void enqueue_task_mlq(struct rq *rq, struct task_struct *p, int flags) {
-    struct sched_mlq_entity *mlq_se = &p->mlq;
+static inline
+void inc_mlq_tasks(struct sched_mlq_entity *mlq_se, struct mlq_rq *mlq_rq)
+{
+	int prio = mlq_se_prio(mlq_se);
 
-    if (flags & ENQUEUE_WAKEUP) mlq_se->timeout = 0;
-
-    enqueue_mlq_entity(rq, mlq_se, flags & ENQUEUE_HEAD);
-    add_nr_running(rq, 1);
+	WARN_ON(!mlq_prio(prio));
+	mlq_rq->mlq_nr_running++;
+	mlq_rq->rr_nr_running += mlq_rr_nr_running(prio);
 }
 
-static void update_curr_mlq(struct rq *rq) {
+static inline
+void dec_mlq_tasks(struct sched_mlq_entity *mlq_se, struct mlq_rq *mlq_rq)
+{
+	int prio = mlq_se_prio(mlq_se);
+
+	WARN_ON(!mlq_prio(prio));
+	WARN_ON(!mlq_rq->mlq_nr_running);
+	mlq_rq->mlq_nr_running--;
+	mlq_rq->rr_nr_running -= mlq_rr_nr_running(prio);
+}
+
+static void update_curr_mlq(struct rq *rq)
+{
     struct task_struct *curr = rq->curr;
     u64 delta_exec;
+	u64 now;
 
-    delta_exec = rq_clock_task(rq) - curr->se.exec_start;
-    if (unlikely((s64)delta_exec < 0)) delta_exec = 0;
+	if (curr->sched_class != &mlq_sched_class)
+		return;
 
-    schedstat_set(curr->se.statistics.exec_max, max(curr->se.statistics.exec_max, delta_exec));
+	now = rq_clock_task(rq);
+    delta_exec = now - curr->se.exec_start;
+    if (unlikely((s64)delta_exec <= 0))
+		return;
+
+    schedstat_set(curr->se.statistics.exec_max,
+			max(curr->se.statistics.exec_max, delta_exec));
 
     curr->se.sum_exec_runtime += delta_exec;
     account_group_exec_runtime(curr, delta_exec);
 
-    curr->se.exec_start = rq_clock_task(rq);
+    curr->se.exec_start = now;
     cgroup_account_cputime(curr, delta_exec);
 }
 
-static void dequeue_task_mlq(struct rq *rq, struct task_struct *p, int flags) {
+static void enqueue_mlq_entity(struct rq *rq, struct sched_mlq_entity *mlq_se, int flags)
+{
+    struct mlq_prio_array *array = &rq->mlq.active;
+	struct list_head *queue = array->queue + mlq_se_prio(mlq_se);
+
+    if (flags & ENQUEUE_HEAD)
+        list_add(&mlq_se->task_list, queue);
+    else
+        list_add_tail(&mlq_se->task_list, queue);
+
+	__set_bit(mlq_se_prio(mlq_se), array->bitmap);
+    mlq_se->on_rq = 1;
+
+	inc_mlq_tasks(mlq_se, &rq->mlq);
+}
+
+static void dequeue_mlq_entity(struct rq *rq, struct sched_mlq_entity *mlq_se)
+{
+	struct mlq_prio_array *array = &rq->mlq.active;
+
+    list_del_init(&mlq_se->task_list);
+	if (list_empty(array->queue + mlq_se_prio(mlq_se)))
+		__clear_bit(mlq_se_prio(mlq_se), array->bitmap);
+    mlq_se->on_rq = 0;
+
+	dec_mlq_tasks(mlq_se, &rq->mlq);
+}
+
+static void enqueue_task_mlq(struct rq *rq, struct task_struct *p, int flags)
+{
+    struct sched_mlq_entity *mlq_se = &p->mlq;
+
+    if (flags & ENQUEUE_WAKEUP)
+		mlq_se->timeout = 0;
+
+    enqueue_mlq_entity(rq, mlq_se, flags);
+    add_nr_running(rq, 1);
+}
+
+static void dequeue_task_mlq(struct rq *rq, struct task_struct *p, int flags)
+{
     struct sched_mlq_entity *mlq_se = &p->mlq;
 
     update_curr_mlq(rq);
     dequeue_mlq_entity(rq, mlq_se);
+
     sub_nr_running(rq, 1);
 }
 
-static void requeue_task_mlq(struct rq *rq, struct task_struct *p) {
-    list_move_tail(&p->mlq.task_list, &rq->mlq.task_list);
+static void requeue_task_mlq(struct rq *rq, struct task_struct *p, int head)
+{
+	struct sched_mlq_entity *mlq_se = &p->mlq;
+
+	if (on_mlq_rq(mlq_se))
+	{
+		struct mlq_prio_array *array = &rq->mlq.active;
+		struct list_head *queue = array->queue + mlq_se_prio(mlq_se);
+
+		if (head)
+			list_move(&mlq_se->task_list, queue);
+		else
+			list_move_tail(&mlq_se->task_list, queue);
+	}
 }
 
-static void yield_task_mlq(struct rq *rq) { requeue_task_mlq(rq, rq->curr); }
+static void yield_task_mlq(struct rq *rq)
+{
+	requeue_task_mlq(rq, rq->curr, 0);
+}
 
-/* No preemption */
-static void check_preempt_curr_mlq(struct rq *rq, struct task_struct *p, int flags) {}
+static void check_preempt_curr_mlq(struct rq *rq, struct task_struct *p, int flags)
+{
+	if (p->sched_class == &mlq_sched_class
+			&& rq->curr->sched_class == &mlq_sched_class
+			&& p->prio < rq->curr->prio)
+	{
+		resched_curr(rq);
+		return;
+	}
+}
 
-static inline void set_next_task_mlq(struct rq *rq, struct task_struct *p, bool first) {
+static inline void set_next_task_mlq(struct rq *rq, struct task_struct *p, bool first)
+{
     p->se.exec_start = rq_clock_task(rq);
 }
 
-static struct task_struct *pick_next_task_mlq(struct rq *rq) {
-    struct task_struct *next;
-    struct sched_mlq_entity *next_se;
+static struct sched_mlq_entity *pick_next_mlq_entity(struct rq *rq,
+							struct mlq_rq *mlq_rq)
+{
+	struct mlq_prio_array *array = &mlq_rq->active;
+	struct sched_mlq_entity *next = NULL;
+	struct list_head *queue;
+	int idx;
 
-    if (!rq->mlq.mlq_nr_running) return NULL;
+	idx = sched_find_first_bit(array->bitmap);
+	BUG_ON(idx >= MAX_MLQ_PRIO);
+	
+	queue = array->queue + idx;
+	next = list_entry(queue->next, struct sched_mlq_entity, task_list);
 
-    next_se = list_first_entry(&rq->mlq.task_list, struct sched_mlq_entity, task_list);
-    next = mlq_task_of(next_se);
-    if (!next) return NULL;
-
-    next->se.exec_start = rq_clock_task(rq);
-    set_next_task_mlq(rq, next, true);
-    return next;
+	return next;
 }
 
-static void task_tick_mlq(struct rq *rq, struct task_struct *p, int queued) {
+static struct task_struct *_pick_next_task_mlq(struct rq *rq)
+{
+    struct sched_mlq_entity *mlq_se;
+	struct mlq_rq *mlq_rq = &rq->mlq;
+
+    mlq_se = pick_next_mlq_entity(rq, mlq_rq);
+	BUG_ON(!mlq_se);
+    
+	return mlq_task_of(mlq_se);
+}
+
+static struct task_struct *pick_task_mlq(struct rq *rq)
+{
+    struct task_struct *p;
+
+	if (!sched_mlq_runnable(rq))
+		return NULL;
+
+	p = _pick_next_task_mlq(rq);
+
+	return p;
+}
+
+static struct task_struct *pick_next_task_mlq(struct rq *rq)
+{
+
+	struct task_struct *p = pick_task_mlq(rq);
+
+	if (p)
+    	set_next_task_mlq(rq, p, true);
+
+	return p;
+}
+
+static void put_prev_task_mlq(struct rq *rq, struct task_struct *p)
+{
+    update_curr_mlq(rq);
+}
+
+static void task_tick_mlq(struct rq *rq, struct task_struct *p, int queued)
+{
     struct sched_mlq_entity *mlq_se = &p->mlq;
+	int prio = mlq_se_prio(mlq_se);
 
     update_curr_mlq(rq);
 
-    if (p->policy != SCHED_MLQ) return;
+    if (p->policy != SCHED_MLQ || !mlq_rr_nr_running(prio))
+		return;
 
-    if (--mlq_se->time_slice) return;
+    if (--mlq_se->time_slice)
+		return;
 
-    mlq_se->time_slice = MLQ_TIMESLICE;
+    mlq_se->time_slice = mlq_rr_get_timeslice(prio);
+	WARN_ON(!mlq_se->time_slice);
 
     if (mlq_se->task_list.prev != mlq_se->task_list.next) {
         requeue_task_mlq(rq, p);
@@ -114,21 +246,19 @@ static void task_tick_mlq(struct rq *rq, struct task_struct *p, int queued) {
     }
 }
 
+static unsigned int get_rr_interval_mlq(struct rq *rq, struct task_struct *task)
+{
+	return mlq_rr_get_timeslice(task->prio);
+}
+
 /* No preemption so no priority */
 static void prio_changed_mlq(struct rq *rq, struct task_struct *p, int oldprio) {}
 
 static void switched_to_mlq(struct rq *rq, struct task_struct *p) {}
 
-static unsigned int get_rr_interval_mlq(struct rq *rq, struct task_struct *task) { return MLQ_TIMESLICE; }
-
-static void put_prev_task_mlq(struct rq *rq, struct task_struct *p) {
-    if (on_mlq_rq(&p->mlq)) update_curr_mlq(rq);
-}
-
 #ifdef CONFIG_SMP
 
 static int can_migrate_task(struct task_struct *p, struct rq *src_rq, struct rq *dst_rq) {
-    // p's policy has to be MY_RR
     if (p->policy != SCHED_MLQ) return 0;
     // if cpu is offline then don't move
     if (!cpu_active(dst_rq->cpu)) return 0;
@@ -195,6 +325,7 @@ static struct task_struct *pick_loadable_task(struct rq *rq, struct rq *dst_rq) 
 }
 
 static int balance_mlq(struct rq *rq, struct task_struct *prev, struct rq_flags *rf) {
+
     int max_nr_running = 0;
     int this_cpu = rq->cpu, cpu;
     struct task_struct *p;
@@ -256,36 +387,37 @@ static void switched_from_mlq(struct rq *rq, struct task_struct *p) {}
 
 #endif /* CONFIG_SMP */
 
-const struct sched_class mlq_sched_class __section("__mlq_sched_class") = {
-    .enqueue_task = enqueue_task_mlq,
-    .dequeue_task = dequeue_task_mlq,
-    .yield_task = yield_task_mlq,
+DEFINE_SCHED_CLASS(mlq) = {
+
+    .enqueue_task	= enqueue_task_mlq,
+    .dequeue_task	= dequeue_task_mlq,
+    .yield_task		= yield_task_mlq,
 
     .check_preempt_curr = check_preempt_curr_mlq,
 
-    .pick_next_task = pick_next_task_mlq,
-    .put_prev_task = put_prev_task_mlq,
-    .set_next_task = set_next_task_mlq,
+    .pick_next_task		= pick_next_task_mlq,
+    .put_prev_task		= put_prev_task_mlq,
+    .set_next_task		= set_next_task_mlq,
 
 #ifdef CONFIG_SMP
-    .balance = balance_mlq,
-    .select_task_rq = select_task_rq_mlq,
-
+    .balance		= balance_mlq,
+    .select_task_rq	= select_task_rq_mlq,
+    .set_cpus_allowed = set_cpus_allowed_common,
     .rq_online = rq_online_mlq,
     .rq_offline = rq_offline_mlq,
     .task_woken = task_woken_mlq,
-    .set_cpus_allowed = set_cpus_allowed_common,
-
     .switched_from = switched_from_mlq,
 #endif
 
     .task_tick = task_tick_mlq,
 
-    .switched_to = switched_to_mlq,
-    .prio_changed = prio_changed_mlq,
     .get_rr_interval = get_rr_interval_mlq,
 
+    .prio_changed = prio_changed_mlq,
+    .switched_to = switched_to_mlq,
+
     .update_curr = update_curr_mlq,
+
 #ifdef CONFIG_UCLAMP_TASK
     .uclamp_enabled = 1,
 #endif

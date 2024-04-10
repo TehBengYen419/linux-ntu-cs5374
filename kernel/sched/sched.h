@@ -276,6 +276,11 @@ struct rt_bandwidth {
 	unsigned int		rt_period_active;
 };
 
+struct mlq_prio_array {
+	DECLARE_BITMAP(bitmap, MAX_MLQ_PRIO+1);
+	struct list_head queue[MAX_MLQ_PRIO];
+};
+
 void __dl_clear_params(struct task_struct *p);
 
 struct dl_bandwidth {
@@ -687,8 +692,9 @@ static inline bool rt_rq_is_runnable(struct rt_rq *rt_rq)
 }
 
 struct mlq_rq {
+	struct mlq_prio_array active;
 	unsigned int mlq_nr_running;
-	struct list_head task_list;
+	unsigned int rr_nr_running;
 };
 
 /* Deadline class' related fields in a runqueue */
@@ -2255,6 +2261,11 @@ static inline bool sched_rt_runnable(struct rq *rq)
 static inline bool sched_fair_runnable(struct rq *rq)
 {
 	return rq->cfs.nr_running > 0;
+}
+
+static inline bool sched_mlq_runnable(struct rq *rq)
+{
+	return rq->mlq.mlq_nr_running > 0;
 }
 
 extern struct task_struct *pick_next_task_fair(struct rq *rq, struct task_struct *prev, struct rq_flags *rf);
