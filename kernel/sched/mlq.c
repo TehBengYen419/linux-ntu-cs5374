@@ -12,6 +12,12 @@ void init_mlq_rq(struct mlq_rq *mlq_rq) {
 	}
 	__set_bit(MAX_MLQ_PRIO, array->bitmap);
 	mlq_rq->mlq_nr_running = 0;
+
+#if defined CONFIG_SMP
+	mlq_rq->highest_prio.curr = MAX_MLQ_PRIO - 1;
+	mlq_rq->highest_prio.next = MAX_MLQ_PRIO - 1;
+	plist_head_init(&mlq_rq->pushable_tasks);
+#endif
 }
 
 static inline int on_mlq_rq(struct sched_mlq_entity *mlq_se)
@@ -36,6 +42,117 @@ int mlq_rr_nr_running(int prio)
 	return (prio < MAX_MLQ_RR_PRIO)? 1 : 0;
 }
 
+#ifdef CONFIG_SMP
+static void
+inc_mlq_prio(struct mlq_rq *mlq_rq, int prio)
+{
+	int prev_prio = mlq_rq->highest_prio.curr;
+
+	if (prio < prev_prio)
+		mlq_rq->highest_prio.curr = prio;
+}
+
+static void
+dec_mlq_prio(struct mlq_rq *mlq_rq, int prio)
+{
+	int prev_prio = mlq_rq->highest_prio.curr;
+
+	if (mlq_rq->mlq_nr_running) {
+
+		WARN_ON(prio < prev_prio);
+
+		/*
+		 * This may have been our highest task, and therefore
+		 * we may have some recomputation to do
+		 */
+		if (prio == prev_prio) {
+			struct mlq_prio_array *array = &mlq_rq->active;
+
+			mlq_rq->highest_prio.curr =
+				sched_find_first_bit(array->bitmap);
+		}
+
+	} else {
+		mlq_rq->highest_prio.curr = MAX_MLQ_PRIO-1;
+	}
+}
+
+static inline int has_pushable_tasks(struct rq *rq)
+{
+	return !plist_head_empty(&rq->mlq.pushable_tasks);
+}
+
+static void enqueue_pushable_task(struct rq *rq, struct task_struct *p)
+{
+	plist_del(&p->pushable_tasks, &rq->mlq.pushable_tasks);
+	plist_node_init(&p->pushable_tasks, p->prio);
+	plist_add(&p->pushable_tasks, &rq->mlq.pushable_tasks);
+
+	if (p->prio < rq->mlq.highest_prio.next)
+		rq->mlq.highest_prio.next = p->prio;
+}
+
+static void dequeue_pushable_task(struct rq *rq, struct task_struct *p)
+{
+	plist_del(&p->pushable_tasks, &rq->mlq.pushable_tasks);
+
+	if (has_pushable_tasks(rq)) {
+		p = plist_first_entry(&rq->mlq.pushable_tasks,
+				      struct task_struct, pushable_tasks);
+		rq->mlq.highest_prio.next = p->prio;
+	} else {
+		rq->mlq.highest_prio.next = MAX_MLQ_PRIO-1;
+	}
+}
+
+static inline bool need_pull_mlq_task(struct rq *rq, struct task_struct *prev)
+{
+	/* if current prio belongs to mlq task or the sched_class with higher prio */
+	return rq->online && (prev->prio < MAX_RT_PRIO); 
+}
+
+static int pick_mlq_task(struct rq *rq, struct task_struct *p, int cpu)
+{
+	if (!task_running(rq, p) &&
+	    cpumask_test_cpu(cpu, &p->cpus_mask))	// affinity
+		return 1;
+
+	return 0;
+}
+
+static struct task_struct *pick_highest_pushable_task(struct rq *rq, int cpu)
+{
+	struct plist_head *head = &rq->mlq.pushable_tasks;
+	struct task_struct *p;
+
+	if (!has_pushable_tasks(rq))
+		return NULL;
+
+	plist_for_each_entry(p, head, pushable_tasks) {
+		if (pick_mlq_task(rq, p, cpu))
+			return p;
+	}
+
+	return NULL;
+}
+
+#else	/* !CONFIG_SMP */
+static inline void inc_mlq_prio(struct mlq_rq *mlq_rq, int prio) {}
+static inline void dec_mlq_prio(struct mlq_rq *mlq_rq, int prio) {}
+static inline void enqueue_pushable_task(struct rq *rq, struct task_struct *p) {}
+static inline void dequeue_pushable_task(struct rq *rq, struct task_struct *p) {}
+static void pull_mlq_task(struct rq *this_rq) {}
+static inline bool need_pull_mlq_task(struct rq *rq, struct task_struct *prev)
+{
+	return false;
+}
+static struct task_struct *pick_highest_pushable_task(struct rq *rq, int cpu)
+{
+	return NULL;
+}
+#endif
+
+
 static inline
 void inc_mlq_tasks(struct sched_mlq_entity *mlq_se, struct mlq_rq *mlq_rq)
 {
@@ -44,6 +161,8 @@ void inc_mlq_tasks(struct sched_mlq_entity *mlq_se, struct mlq_rq *mlq_rq)
 	WARN_ON(!mlq_prio(prio));
 	mlq_rq->mlq_nr_running++;
 	mlq_rq->rr_nr_running += mlq_rr_nr_running(prio);
+
+	inc_mlq_prio(mlq_rq, prio);
 }
 
 static inline
@@ -55,6 +174,8 @@ void dec_mlq_tasks(struct sched_mlq_entity *mlq_se, struct mlq_rq *mlq_rq)
 	WARN_ON(!mlq_rq->mlq_nr_running);
 	mlq_rq->mlq_nr_running--;
 	mlq_rq->rr_nr_running -= mlq_rr_nr_running(prio);
+
+	dec_mlq_prio(mlq_rq, prio);
 }
 
 static void update_curr_mlq(struct rq *rq)
@@ -86,10 +207,11 @@ static void enqueue_mlq_entity(struct rq *rq, struct sched_mlq_entity *mlq_se, i
     struct mlq_prio_array *array = &rq->mlq.active;
 	struct list_head *queue = array->queue + mlq_se_prio(mlq_se);
 
-    if (flags & ENQUEUE_HEAD)
+    if (flags & ENQUEUE_HEAD) {
         list_add(&mlq_se->task_list, queue);
-    else
+	} else {
         list_add_tail(&mlq_se->task_list, queue);
+	}
 
 	__set_bit(mlq_se_prio(mlq_se), array->bitmap);
     mlq_se->on_rq = 1;
@@ -117,6 +239,9 @@ static void enqueue_task_mlq(struct rq *rq, struct task_struct *p, int flags)
 		mlq_se->timeout = 0;
 
     enqueue_mlq_entity(rq, mlq_se, flags);
+
+	if (!task_current(rq, p) && p->nr_cpus_allowed > 1)
+		enqueue_pushable_task(rq, p);
     add_nr_running(rq, 1);
 }
 
@@ -127,6 +252,7 @@ static void dequeue_task_mlq(struct rq *rq, struct task_struct *p, int flags)
     update_curr_mlq(rq);
     dequeue_mlq_entity(rq, mlq_se);
 
+	dequeue_pushable_task(rq, p);
     sub_nr_running(rq, 1);
 }
 
@@ -160,11 +286,14 @@ static void check_preempt_curr_mlq(struct rq *rq, struct task_struct *p, int fla
 		resched_curr(rq);
 		return;
 	}
+	/* TODO: consider migration as same as rt if needed */
 }
 
 static inline void set_next_task_mlq(struct rq *rq, struct task_struct *p, bool first)
 {
     p->se.exec_start = rq_clock_task(rq);
+
+	dequeue_pushable_task(rq, p);
 }
 
 static struct sched_mlq_entity *pick_next_mlq_entity(struct rq *rq,
@@ -209,7 +338,6 @@ static struct task_struct *pick_task_mlq(struct rq *rq)
 
 static struct task_struct *pick_next_task_mlq(struct rq *rq)
 {
-
 	struct task_struct *p = pick_task_mlq(rq);
 
 	if (p)
@@ -221,6 +349,9 @@ static struct task_struct *pick_next_task_mlq(struct rq *rq)
 static void put_prev_task_mlq(struct rq *rq, struct task_struct *p)
 {
     update_curr_mlq(rq);
+
+	if (on_mlq_rq(&p->mlq) && p->nr_cpus_allowed > 1)
+		enqueue_pushable_task(rq, p);
 }
 
 static void task_tick_mlq(struct rq *rq, struct task_struct *p, int queued)
@@ -240,7 +371,7 @@ static void task_tick_mlq(struct rq *rq, struct task_struct *p, int queued)
 	WARN_ON(!mlq_se->time_slice);
 
     if (mlq_se->task_list.prev != mlq_se->task_list.next) {
-        requeue_task_mlq(rq, p);
+        requeue_task_mlq(rq, p, 0);
         resched_curr(rq);
         return;
     }
@@ -251,130 +382,113 @@ static unsigned int get_rr_interval_mlq(struct rq *rq, struct task_struct *task)
 	return mlq_rr_get_timeslice(task->prio);
 }
 
-/* No preemption so no priority */
 static void prio_changed_mlq(struct rq *rq, struct task_struct *p, int oldprio) {}
 
 static void switched_to_mlq(struct rq *rq, struct task_struct *p) {}
 
 #ifdef CONFIG_SMP
-
-static int can_migrate_task(struct task_struct *p, struct rq *src_rq, struct rq *dst_rq) {
-    if (p->policy != SCHED_MLQ) return 0;
-    // if cpu is offline then don't move
-    if (!cpu_active(dst_rq->cpu)) return 0;
-    // Do not steal a task from CPUs with fewer than 2 tasks.
-    if (src_rq->mlq.mlq_nr_running < 2) return 0;
-    // Make sure to respect the CPU affinity of a given task.
-    if (!cpumask_test_cpu(dst_rq->cpu, p->cpus_ptr)) return 0;
-    // Do not move tasks that are currently running on a CPU (obviously).
-    if (task_running(src_rq, p)) return 0;
-    // Make sure to respect per-CPU kthreads. These should remain on their specified CPUs.
-    if (kthread_is_per_cpu(p)) return 0;
-    // if not in current cpu then don't move
-    if (task_cpu(p) != src_rq->cpu) return 0;
-
-    return 1;
-}
-
-static int select_task_rq_mlq(struct task_struct *p, int cpu, int sd_flag) {
+static int
+select_task_rq_mlq(struct task_struct *p, int cpu, int flags)
+{
     struct rq *rq;
-    int cpus;
-    int min;
-    int best_cpu;
+    int target = cpu, cpus, min;
     cpumask_t cpumask = p->cpus_mask;
 
-    if (sd_flag != SD_BALANCE_WAKE && sd_flag != SD_BALANCE_FORK) return cpu;
+    if (!(flags & (WF_TTWU | WF_FORK)))
+		return target;
+
+	rq = cpu_rq(cpu);
+    min = rq->nr_running;
 
     rcu_read_lock();
 
-    min = -1;
-
     for_each_cpu(cpus, &cpumask) {
+		
+		if(cpus == cpu)
+			continue;
+
         rq = cpu_rq(cpus);
 
-        if ((min == -1 || min > rq->nr_running) && cpu_online(cpus)) {
+        if ((rq->nr_running <= min) && cpu_online(cpus))
+		{
             min = rq->nr_running;
-            best_cpu = cpus;
-        }
+
+			if (min == rq->nr_running &&
+					p->prio >= rq->mlq.highest_prio.curr)
+				continue;
+
+            target = cpus;
+		} 
     }
 
     rcu_read_unlock();
 
-    if (min == -1) return cpu;
-
-    return best_cpu;
+    return target;
 }
 
-static struct task_struct *pick_loadable_task(struct rq *rq, struct rq *dst_rq) {
-    struct list_head *head = &rq->mlq.task_list;
-    struct task_struct *p;
-    struct sched_mlq_entity *se;
+static void pull_mlq_task(struct rq *this_rq)
+{
+	int this_cpu = this_rq->cpu, cpu;
+	bool resched = false;
+	struct task_struct *p;
+	struct rq *src_rq;
+	int this_nr_running = this_rq->mlq.mlq_nr_running;
 
-    // Do not steal a task from CPUs with fewer than 2 tasks.
-    if (rq->mlq.mlq_nr_running < 2) return NULL;
+	for_each_online_cpu(cpu) {
+		if (this_cpu == cpu)
+			continue;
 
-    se = list_last_entry(&rq->mlq.task_list, struct sched_mlq_entity, task_list);
-    p = mlq_task_of(se);
+		src_rq = cpu_rq(cpu);
 
-    list_for_each_entry(se, head, task_list) {
-        p = mlq_task_of(se);
-        if (can_migrate_task(p, rq, dst_rq)) return p;
-    }
+		if (src_rq->mlq.highest_prio.next >=
+			this_rq->mlq.highest_prio.curr)
+			continue;
 
-    return NULL;
+		if (src_rq->mlq.mlq_nr_running > this_nr_running)
+		{
+        	double_lock_balance(this_rq, src_rq);
+
+			p = pick_highest_pushable_task(src_rq, this_cpu);
+
+			if (p && (p->prio < this_rq->mlq.highest_prio.curr)) {
+				WARN_ON(p == src_rq->curr);
+				WARN_ON(!task_on_rq_queued(p));
+
+				if (p->prio < src_rq->curr->prio || is_migration_disabled(p))
+					goto skip;
+
+				deactivate_task(src_rq, p, 0);
+				set_task_cpu(p, this_cpu);
+				activate_task(this_rq, p, 0);
+
+				/* 
+				 * make increment to running tasks in this cpu,
+				 * then we can continue to do migration on other tasks,
+				 * if number of tasks in other cpu still larger than
+				 * this cpu.
+				 */
+				this_nr_running++;
+				resched = true;
+			}
+		}
+skip:
+		double_unlock_balance(this_rq, src_rq);
+	}
+
+	if (resched)
+		resched_curr(this_rq);
 }
 
-static int balance_mlq(struct rq *rq, struct task_struct *prev, struct rq_flags *rf) {
+static int balance_mlq(struct rq *rq, struct task_struct *p, struct rq_flags *rf) {
 
-    int max_nr_running = 0;
-    int this_cpu = rq->cpu, cpu;
-    struct task_struct *p;
-    struct rq *src_rq, *busiest_rq;
+	if (!on_mlq_rq(&p->mlq) && need_pull_mlq_task(rq, p)) {
+    	rq_unpin_lock(rq, rf);
+		pull_mlq_task(rq);
+		rq_repin_lock(rq, rf);
+	}
 
-    rq_unpin_lock(rq, rf);
-
-    if (rq->nr_running != 0) {
-        rq_repin_lock(rq, rf);
-        return 0;
-    }
-
-    for_each_online_cpu(cpu) {
-        if (this_cpu == cpu) continue;
-
-        src_rq = cpu_rq(cpu);
-
-        if (max_nr_running >= src_rq->mlq.mlq_nr_running) continue;
-
-        max_nr_running = src_rq->mlq.mlq_nr_running;
-        busiest_rq = cpu_rq(cpu);
-    }
-
-    if (max_nr_running != 0) {
-        double_lock_balance(rq, busiest_rq);
-
-        p = pick_loadable_task(busiest_rq, rq);
-
-        if (!p) {
-            double_unlock_balance(rq, busiest_rq);
-            goto out;
-        }
-
-        deactivate_task(busiest_rq, p, 0);
-        set_task_cpu(p, this_cpu);
-        activate_task(rq, p, 0);
-
-        double_unlock_balance(rq, busiest_rq);
-
-        resched_curr(rq);
-
-        rq_repin_lock(rq, rf);
-        return 1;
-    }
-
-out:
-    rq_repin_lock(rq, rf);
-
-    return 0;
+	return sched_stop_runnable(rq) || sched_dl_runnable(rq)
+		|| sched_rt_runnable(rq) || sched_mlq_runnable(rq);
 }
 
 static void rq_online_mlq(struct rq *rq) {}
@@ -400,8 +514,9 @@ DEFINE_SCHED_CLASS(mlq) = {
     .set_next_task		= set_next_task_mlq,
 
 #ifdef CONFIG_SMP
-    .balance		= balance_mlq,
-    .select_task_rq	= select_task_rq_mlq,
+    .balance			= balance_mlq,
+	.pick_task			= pick_task_mlq,
+    .select_task_rq		= select_task_rq_mlq,
     .set_cpus_allowed = set_cpus_allowed_common,
     .rq_online = rq_online_mlq,
     .rq_offline = rq_offline_mlq,

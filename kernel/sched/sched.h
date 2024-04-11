@@ -695,6 +695,14 @@ struct mlq_rq {
 	struct mlq_prio_array active;
 	unsigned int mlq_nr_running;
 	unsigned int rr_nr_running;
+
+#ifdef CONFIG_SMP
+	struct {
+		int		curr; /* highest queued mlq task prio */
+		int		next; /* next highest */
+	} highest_prio;
+	struct plist_head	pushable_tasks;
+#endif
 };
 
 /* Deadline class' related fields in a runqueue */
