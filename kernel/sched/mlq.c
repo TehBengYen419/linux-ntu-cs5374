@@ -161,7 +161,7 @@ void inc_mlq_tasks(struct sched_mlq_entity *mlq_se, struct mlq_rq *mlq_rq)
 	WARN_ON(!mlq_prio(prio));
 	mlq_rq->mlq_nr_running++;
 	mlq_rq->rr_nr_running += mlq_rr_nr_running(prio);
-
+	
 	inc_mlq_prio(mlq_rq, prio);
 }
 
@@ -354,12 +354,42 @@ static void put_prev_task_mlq(struct rq *rq, struct task_struct *p)
 		enqueue_pushable_task(rq, p);
 }
 
+#ifdef CONFIG_POSIX_TIMERS
+static void watchdog(struct rq *rq, struct task_struct *p)
+{
+	unsigned long soft, hard;
+
+	/* max may change after cur was read, this will be fixed next tick */
+	soft = task_rlimit(p, RLIMIT_RTTIME);
+	hard = task_rlimit_max(p, RLIMIT_RTTIME);
+
+	if (soft != RLIM_INFINITY) {
+		unsigned long next;
+
+		if (p->rt.watchdog_stamp != jiffies) {
+			p->rt.timeout++;
+			p->rt.watchdog_stamp = jiffies;
+		}
+
+		next = DIV_ROUND_UP(min(soft, hard), USEC_PER_SEC/HZ);
+		if (p->rt.timeout > next) {
+			posix_cputimers_rt_watchdog(&p->posix_cputimers,
+						    p->se.sum_exec_runtime);
+		}
+	}
+}
+#else
+static inline void watchdog(struct rq *rq, struct task_struct *p) { }
+#endif
+
 static void task_tick_mlq(struct rq *rq, struct task_struct *p, int queued)
 {
     struct sched_mlq_entity *mlq_se = &p->mlq;
 	int prio = mlq_se_prio(mlq_se);
 
     update_curr_mlq(rq);
+
+	watchdog(rq, p);
 
     if (p->policy != SCHED_MLQ || !mlq_rr_nr_running(prio))
 		return;

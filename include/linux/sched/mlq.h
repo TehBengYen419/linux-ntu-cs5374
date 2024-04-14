@@ -4,8 +4,8 @@
 #define MAX_MLQ_PRIO	4
 #define MAX_MLQ_RR_PRIO	3
 
-/* default timeslices is 100 msecs */
-#define MLQ_TIMESLICE   (100 * HZ / 1000)
+/* default timeslices is 50 msecs */
+#define MLQ_TIMESLICE   (50 * HZ / 1000)
 
 static inline int mlq_prio(int prio)
 {
@@ -17,7 +17,7 @@ static inline int mlq_prio(int prio)
 static inline int mlq_rr_get_timeslice(int prio)
 {
 	BUG_ON(prio <= 0 && prio >= MAX_MLQ_PRIO);
-	return (prio >= MAX_MLQ_RR_PRIO)? 0 : MLQ_TIMESLICE / prio;
+	return (prio >= MAX_MLQ_RR_PRIO)? 0 : MLQ_TIMESLICE * prio;
 }
 
 #endif /* _LINUX_SCHED_MLQ_H */

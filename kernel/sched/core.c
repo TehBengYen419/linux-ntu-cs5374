@@ -6712,6 +6712,8 @@ static void __setscheduler_prio(struct task_struct *p, int prio)
 {
 	if (dl_prio(prio))
 		p->sched_class = &dl_sched_class;
+	else if (mlq_policy(p->policy) && mlq_prio(prio))
+		p->sched_class = &mlq_sched_class;
 	else if (rt_prio(prio))
 		p->sched_class = &rt_sched_class;
 	else
@@ -7189,9 +7191,10 @@ static void __setscheduler_params(struct task_struct *p,
 		__setparam_dl(p, attr);
 	else if (fair_policy(policy))
 		p->static_prio = NICE_TO_PRIO(attr->sched_nice);
-	else if (mlq_policy(policy))
+	else if (mlq_policy(policy)) {
 		p->mlq_priority = attr->sched_priority;
-	else
+		p->mlq.time_slice = mlq_rr_get_timeslice(p->mlq_priority);
+	} else
 		p->rt_priority = attr->sched_priority;
 	/*
 	 * __sched_setscheduler() ensures attr->sched_priority == 0 when
