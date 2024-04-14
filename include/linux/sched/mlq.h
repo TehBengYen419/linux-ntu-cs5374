@@ -9,7 +9,7 @@
 
 static inline int mlq_prio(int prio)
 {
-	if (unlikely(prio < MAX_MLQ_PRIO))
+	if (unlikely((prio > 0 && prio < MAX_MLQ_PRIO)))
 		return 1;
 	return 0;
 }
