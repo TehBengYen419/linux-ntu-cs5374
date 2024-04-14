@@ -17,7 +17,7 @@ static inline int mlq_prio(int prio)
 static inline int mlq_rr_get_timeslice(int prio)
 {
 	BUG_ON(prio <= 0 && prio >= MAX_MLQ_PRIO);
-	return (prio > MAX_MLQ_RR_PRIO)? 0 : MLQ_TIMESLICE / prio;
+	return (prio >= MAX_MLQ_RR_PRIO)? 0 : MLQ_TIMESLICE / prio;
 }
 
 #endif /* _LINUX_SCHED_MLQ_H */
