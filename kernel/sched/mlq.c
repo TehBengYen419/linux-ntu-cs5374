@@ -479,7 +479,7 @@ static void pull_mlq_task(struct rq *this_rq)
 
 			p = pick_highest_pushable_task(src_rq, this_cpu);
 
-			if (p && (p->prio < this_rq->mlq.highest_prio.curr)) {
+			if (p && (p->prio <= this_rq->mlq.highest_prio.curr)) {
 				WARN_ON(p == src_rq->curr);
 				WARN_ON(!task_on_rq_queued(p));
 
