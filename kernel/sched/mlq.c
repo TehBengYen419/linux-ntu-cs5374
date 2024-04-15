@@ -441,12 +441,11 @@ select_task_rq_mlq(struct task_struct *p, int cpu, int flags)
 
         if ((rq->nr_running <= min) && cpu_online(cpus))
 		{
-            min = rq->nr_running;
-
 			if (min == rq->nr_running &&
-					p->prio >= rq->mlq.highest_prio.curr)
+					p->prio > rq->mlq.highest_prio.curr)
 				continue;
 
+            min = rq->nr_running;
             target = cpus;
 		} 
     }
