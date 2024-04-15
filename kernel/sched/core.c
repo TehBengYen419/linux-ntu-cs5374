@@ -7259,9 +7259,8 @@ recheck:
 	if (attr->sched_priority > MAX_RT_PRIO-1)
 		return -EINVAL;
 	if ((dl_policy(policy) && !__checkparam_dl(attr)) ||
-	    (rt_policy(policy) && !rt_prio(attr->sched_priority)) || 
+	    (rt_policy(policy) && !rt_prio(attr->sched_priority)) ||
 		(mlq_policy(policy) && !mlq_prio(attr->sched_priority))) {
-		pr_info("policy %d, prio %d\n", policy, attr->sched_priority);
 		return -EINVAL;
 	}
 	/*
@@ -7504,8 +7503,6 @@ static int _sched_setscheduler(struct task_struct *p, int policy,
 		.sched_nice	= PRIO_TO_NICE(p->static_prio),
 	};
 
-	pr_info("_sched_setscheduler: %d %d %d\n", policy, param->sched_priority, attr.sched_nice);
-
 	/* Fixup the legacy SCHED_RESET_ON_FORK hack. */
 	if ((policy != SETPARAM_POLICY) && (policy & SCHED_RESET_ON_FORK)) {
 		attr.sched_flags |= SCHED_FLAG_RESET_ON_FORK;
@@ -7704,8 +7701,6 @@ SYSCALL_DEFINE3(sched_setscheduler, pid_t, pid, int, policy, struct sched_param 
 {
 	if (policy < 0)
 		return -EINVAL;
-
-	pr_info("pid %d, policy %d\n", pid, policy);
 
 	return do_sched_setscheduler(pid, policy, param);
 }
